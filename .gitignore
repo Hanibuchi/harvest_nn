@@ -1,0 +1,20 @@
+# Dataset (2.9GB, CC-BY-NC-SA — 再配布不可のため追跡しない)
+KFuji_RGB-DS_dataset/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# 学習成果物・ログ
+*.pt
+*.pth
+*.ckpt
+runs/
+logs/
+wandb/
