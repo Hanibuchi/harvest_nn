@@ -25,9 +25,41 @@ Approach for Harvesting Robots"* (Journal of Field Robotics) の Figure 6 上段
 
 ## 1. 準備
 
-### 1-1. データセットを置く
+### 1-1. データセットを用意する
 
-`KFuji_RGB-DS_dataset` フォルダを、このプロジェクトの直下に置いてください。
+**自動で取得できます。** 環境を増やすたびに手でコピーする必要はありません。
+
+```bash
+python src/fetch_dataset.py
+```
+
+[Zenodo](https://zenodo.org/records/3715991) から必要なファイルだけを取得して、
+`KFuji_RGB-DS_dataset/` を作ります。追加のライブラリは要りません（標準ライブラリだけで動きます）。
+
+- 取得量は **約585MB**（配布zip全体 2.9GB の19%）です。
+  残りの大部分は `preprocessed data/images/*_DS.mat`（位置合わせ済みの深度データ）で、
+  このプロジェクトでは使わないため取得しません（理由は後述の 5-3）。
+- 取得したファイルは1つずつ CRC で照合するので、壊れたまま進むことはありません。
+- 途中で止まっても、もう一度同じコマンドを実行すれば**残りだけ**を取得します。
+- Zenodo 側が混んでいると 1MB/秒を下回ることがあり、その場合は20〜40分ほどかかります。
+  待てないときは先に `--parts raw,annotations`（約500MB）だけ取得し、
+  学習をするときに `--parts images` を追加で実行してください。
+
+```bash
+# 何をどれだけ取得するか、通信せずに確認する
+python src/fetch_dataset.py --dry-run
+
+# 新しいマシンで、まず少しだけ取得して動作を確かめる
+python src/fetch_dataset.py --parts images --limit-files 20
+
+# 計測だけを行うマシン（Jetson など）で、必要最小限（約500MB）にする
+python src/fetch_dataset.py --parts raw,annotations
+
+# 配布物と全く同じ内容をそろえる（未使用の _DS.mat も含む。2.9GB）
+python src/fetch_dataset.py --parts all
+```
+
+できあがる構成:
 
 ```
 harvest_nn/
@@ -36,8 +68,19 @@ harvest_nn/
     └── preprocessed data/   ← 切り出し済みデータ。学習にはこちらを使う
 ```
 
-別の場所に置きたい場合は、各スクリプトに `--dataset-root /path/to/KFuji_RGB-DS_dataset`
-を付けて実行してください。
+**すでにデータセットを持っている場合**は、上の構成になるように置くだけで構いません。
+
+**別の場所に置きたい場合**（外付けSSDなど）は、次のどちらかで指定します。
+
+```bash
+# 方法1: 環境変数で指定する（一度書いておけば、すべてのスクリプトが従います）
+export KFUJI_DATASET_ROOT=/mnt/ssd/KFuji_RGB-DS_dataset
+python src/fetch_dataset.py
+
+# 方法2: コマンドごとに指定する
+python src/fetch_dataset.py --dataset-root /mnt/ssd/KFuji_RGB-DS_dataset
+python src/prepare_dataset.py --dataset-root /mnt/ssd/KFuji_RGB-DS_dataset
+```
 
 ### 1-2. ライブラリをインストールする
 
@@ -91,8 +134,16 @@ Jetson では `--workers 2` を付けて学習すると、メモリ不足にな�
 ## 2. 実行の順番
 
 ```
-① データ準備 → ②（任意）アライメント確認 → ③ 学習 → ④ 計測 → ⑤ 2台の比較
+⓪ データ取得 → ① データ準備 → ②（任意）アライメント確認 → ③ 学習 → ④ 計測 → ⑤ 2台の比較
 ```
+
+### ⓪ データ取得
+
+```bash
+python src/fetch_dataset.py
+```
+
+Zenodo からデータセットを取得します（詳しくは 1-1）。すでに手元にある場合は飛ばせます。
 
 ### ① データ準備
 
@@ -271,7 +322,7 @@ harvest_nn/
 ├── README.md                     このファイル
 ├── requirements.txt              必要なライブラリの一覧
 ├── camera_params.yaml            カメラの内部/外部パラメータの設定（編集可）
-├── KFuji_RGB-DS_dataset/         データセット（各自で配置）
+├── KFuji_RGB-DS_dataset/         データセット（fetch_dataset.py が作る）
 ├── outputs/                      実行結果の出力先（自動で作られます）
 └── src/
     ├── common_paths.py           データセットのファイルの場所を管理する
@@ -280,6 +331,7 @@ harvest_nn/
     ├── localization_3d.py        【ステップ5】3次元座標を計算する
     ├── timing_utils.py           時間を正しく測るための道具
     ├── machine_info.py           CPU名・GPU名などマシン情報を集める
+    ├── fetch_dataset.py          ⓪ データ取得
     ├── prepare_dataset.py        ① データ準備
     ├── verify_alignment.py       ② アライメントの確認（任意）
     ├── train_yolo.py             ③ 学習
@@ -422,6 +474,18 @@ Kinect v2 は深度センサとカラーカメラが物理的に離れた位置�
 **`データセット設定ファイルが見つかりません` と出る**
 → 先に `python src/prepare_dataset.py` を実行してください。
 
+**`データセットのアノテーションフォルダが見つかりません` と出る**
+→ データセットがまだありません。`python src/fetch_dataset.py` を実行してください。
+すでに手元にある場合は `--dataset-root` か環境変数 `KFUJI_DATASET_ROOT` で置き場所を指定してください。
+
+**データの取得が途中で止まった / 回線が切れた**
+→ もう一度 `python src/fetch_dataset.py` を実行してください。
+取得済みのファイルは飛ばして、残りだけを取得します。
+
+**`サーバが範囲指定に対応していません` と出る**
+→ 間にプロキシなどが入っている環境です。自動で「zip全体を取得する方式」に切り替わりますが、
+明示的に `python src/fetch_dataset.py --full-archive` としても構いません（2.9GB 必要です）。
+
 **`計測できるシーンがありません` と出る**
 → 点群の `.npy` がまだ作られていません。
 `python src/prepare_dataset.py --convert-point-clouds test` を実行してください。
@@ -442,6 +506,8 @@ Kinect v2 は深度センサとカラーカメラが物理的に離れた位置�
 ## 9. データセットの利用について
 
 KFuji RGB-DS database は **CC-BY-NC-SA 4.0**（研究・教育目的のみ、商用利用不可）です。
+配布元は Zenodo の <https://zenodo.org/records/3715991> です
+（`fetch_dataset.py` はここから取得します）。
 利用する場合は次の論文を引用してください。
 
 - Gené-Mola J, Vilaplana V, Rosell-Polo JR, Morros JR, Ruiz-Hidalgo J, Gregorio E. (2019).
