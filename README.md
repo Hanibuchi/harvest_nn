@@ -324,6 +324,8 @@ harvest_nn/
 ├── camera_params.yaml            カメラの内部/外部パラメータの設定（編集可）
 ├── KFuji_RGB-DS_dataset/         データセット（fetch_dataset.py が作る）
 ├── outputs/                      実行結果の出力先（自動で作られます）
+├── docs/
+│   └── measure_centralized_dependencies.md  計測スクリプトの処理の依存関係の図
 └── src/
     ├── common_paths.py           データセットのファイルの場所を管理する
     ├── kinect_io.py              カラー画像と点群を読み込む
@@ -450,7 +452,295 @@ Kinect v2 は深度センサとカラーカメラが物理的に離れた位置�
 
 ---
 
-## 7. 設定ファイル `camera_params.yaml`
+## 7. `measure_centralized.py` の処理の詳細
+
+計測スクリプトの中の関数を、**入力（引数）と出力（返り値）** がわかるように1つずつ説明します。
+数値の例は `camera_params.yaml` の既定値（生画像 1920×1080、タイル 548×373 を 3×3 枚、
+`--imgsz 640`）の場合です。
+
+各処理の依存関係の図（Mermaid 記法）は
+[`docs/measure_centralized_dependencies.md`](docs/measure_centralized_dependencies.md) にあります。
+
+### 7-1. 全体の流れ
+
+```
+main()
+ ├─ 準備（計測の外）: 引数の読み取り → 装置の決定 → マシン情報 → camera_params.yaml
+ │                    → alignment_transform / localization_settings / tile_list の事前計算
+ │                    → シーン一覧の読み込み → モデルの読み込み
+ ├─ ウォームアップ   : 1枚目の画像で measure_one_image() を --warmup 回（結果は捨てる）
+ ├─ 本計測           : 画像ごとに
+ │                      measure_one_image() を --warmup-per-image 回（結果は捨てる）
+ │                      measure_one_image() を --repeats 回（ここだけ記録する）
+ └─ 結果の書き出し   : CSV 3種類 + JSON 1つ、画面にまとめを表示
+```
+
+`measure_one_image()` の中でステップ1〜5を順番に実行し、ステップごとに
+`timing_utils.start_timer()` / `stop_timer()` で時間を測ります。
+**設定ファイルの読み込み・行列やタイル位置の計算・モデルの読み込みは計測の外で1回だけ**
+行い、計測にはステップの処理そのものだけが入るようにしています。
+
+### 7-2. 準備用の関数（計測の外で1回だけ呼ばれる）
+
+#### `build_tile_list(tiling_settings, image_width, image_height)`
+
+生画像を切り分けるタイルの位置を計算します。
+
+| | 内容 |
+|---|---|
+| 入力 `tiling_settings` | `camera_params.yaml` の `tiling` の辞書（`tile_width`, `tile_height`, `columns`, `rows`, `stride_x`, `stride_y`, `origin_x`, `origin_y`） |
+| 入力 `image_width`, `image_height` | 生画像の幅と高さ（1920, 1080） |
+| 出力 | タイルの `(左端x, 上端y, 幅, 高さ)` のリスト。既定では 9 個（左上から右へ、行ごとの順） |
+
+- `origin + 列(行)番号 × stride` で各タイルの左上を求めます。
+- タイルが画像の外にはみ出す場合は、画像の内側に収まるように位置をずらします
+  （タイルの大きさは変えません）。
+- 既定値では x = 172, 686, 1200、y = 13, 353, 693 の組み合わせになります。
+
+#### `compute_letterbox_parameters(source_width, source_height, model_input_size)`
+
+横長のタイルを、縦横比を保ったまま正方形のモデル入力に収めるための値を計算します
+（レターボックス）。ステップ3（縮小と余白の追加）とステップ4b（座標を元に戻す）の
+**両方から同じ計算で呼ばれる**ので、2つのステップの座標の変換が必ず一致します。
+
+| | 内容 |
+|---|---|
+| 入力 | タイルの幅・高さ（548, 373）、モデル入力の一辺（640） |
+| 出力 | `(縮小率, 左の余白, 上の余白, 縮小後の幅, 縮小後の高さ)` |
+
+- 縮小率は `min(640/548, 640/373)` ≈ 1.168（実際は拡大）です。
+- 既定値では、縮小後 640×436、左の余白 0、上の余白 102 ピクセルになります。
+
+#### `read_scene_name_list(scene_list_file_path)`
+
+| | 内容 |
+|---|---|
+| 入力 | シーン名が1行に1つ書かれたテキストファイルのパス（既定は `outputs/splits/scenes_test.txt`） |
+| 出力 | シーン名（文字列）のリスト。空の行は除きます |
+
+#### 他のモジュールで用意するもの（`main()` から呼び出す）
+
+| 関数 | 入力 | 出力 |
+|---|---|---|
+| `timing_utils.resolve_device()` | `--device` の値（`auto` / `cuda` / `mps` / `cpu`） | `torch.device`。`auto` なら cuda → mps → cpu の順に選ぶ |
+| `machine_info.collect_machine_information()` | マシン名、装置 | マシン情報の辞書（CPU名・GPU名・メモリ量・各ライブラリのバージョンなど） |
+| `depth_alignment.load_camera_parameters()` | `camera_params.yaml` のパス | 設定全体の辞書 |
+| `depth_alignment.build_alignment_transform()` | 設定全体の辞書 | `alignment_transform`（ステップ2用。軸の並べ替えと回転を1つにまとめた行列、平行移動、fx/fy/cx/cy、画像サイズ、点群の列の対応、隙間を埋める設定） |
+| `localization_3d.build_localization_settings()` | 設定全体の辞書 | `localization_settings`（ステップ5用。`box_shrink_ratio`, `minimum_valid_pixels`, fx/fy/cx/cy） |
+| `ultralytics.YOLO(weights).model` | 重みファイル(.pt) | ニューラルネットワーク本体。`eval()` → `fuse()`（畳み込みとバッチ正規化の統合）→ 装置へ転送 → `--half` なら float16 にする |
+
+モデルは `YOLO` オブジェクトの `predict()` を使わず、**中身のネットワーク (`.model`) だけを
+取り出して**使います。`predict()` は前処理・推論・NMS を一度に行ってしまい、
+ステップごとに時間を分けて測れないためです。
+
+### 7-3. ステップ1〜5（計測の対象）
+
+#### ステップ1 `step1_image_acquisition(color_image_path, point_cloud_npy_path)`
+
+カラー画像と深度データ（点群）をファイルから読み込みます。実際のロボットでは、
+カメラからデータを受け取る部分にあたります。
+
+| | 内容 |
+|---|---|
+| 入力 `color_image_path` | 生のカラー画像 `<シーン名>_RGB.jpg` のパス |
+| 入力 `point_cloud_npy_path` | `.npy` に変換済みの点群 `outputs/point_cloud_npy/<シーン名>_pc.npy` のパス |
+| 出力 `color_image_bgr` | カラー画像。形 `(1080, 1920, 3)`、`uint8`、色は **B, G, R の順** |
+| 出力 `point_cloud_array` | 点群。形 `(N, 8)`、`float32`。列は X, Y, Z（メートル。X=右, Y=前, Z=上）, R, G, B, IR, S。N はシーンによって変わる（例: 約17万点） |
+
+- 中身は `kinect_io.load_color_image()`（`cv2.imread`）と
+  `kinect_io.load_point_cloud_from_npy()`（`np.load`）です。
+- 計測時間には **ファイルの読み込みと JPEG の展開** が含まれます。
+
+#### ステップ2 `step2_depth_alignment(point_cloud_array, alignment_transform)`
+
+点群をカラー画像の座標系に投影して、カラー画像と同じ大きさの深度画像を作ります。
+
+| | 内容 |
+|---|---|
+| 入力 `point_cloud_array` | ステップ1の点群 `(N, 8)` |
+| 入力 `alignment_transform` | `build_alignment_transform()` が作った辞書 |
+| 出力 `depth_image_meters` | 深度画像。形 `(1080, 1920)`、`float32`、単位はメートル。**深度が分からないピクセルは 0** |
+
+中身は `depth_alignment.align_depth_to_color()` で、次の順に計算します。
+
+1. 点群から X, Y, Z の3列を取り出す
+2. 座標軸の並べ替え（X=右,Y=前,Z=上 → x=右,y=下,z=前）と外部パラメータの回転を
+   まとめた行列を掛け、平行移動を足してカラーカメラの座標系に移す
+3. `u = fx·x/z + cx`、`v = fy·y/z + cy` で画像上の位置に投影し、
+   カメラの後ろの点と画像の外に出た点を捨てる
+4. 同じピクセルに複数の点が来たら一番手前の点を残す（Zバッファ。奥行きの逆数の最大値で判定）
+5. `fill_holes: true` なら膨張処理で点と点の隙間を埋める
+6. 逆数を元に戻してメートル単位の深度にする
+
+- **CPU（numpy / OpenCV）だけで計算**します。GPU は使いません。
+- カラー画像は使わないので、ステップ3・4とは互いに依存しません。
+
+#### ステップ3 `step3_inference_preprocessing(color_image_bgr, tile_list, model_input_size, device, use_half_precision)`
+
+カラー画像をタイルに分け、1枚ずつモデルに入力できる形に整えます。
+
+| | 内容 |
+|---|---|
+| 入力 `color_image_bgr` | ステップ1のカラー画像 `(1080, 1920, 3)` BGR |
+| 入力 `tile_list` | `build_tile_list()` が作ったタイル位置のリスト |
+| 入力 `model_input_size` | モデル入力の一辺（`--imgsz`、既定 640） |
+| 入力 `device` | 計算装置（`cuda` / `mps` / `cpu`） |
+| 入力 `use_half_precision` | `True` なら float16、`False` なら float32 にする |
+| 出力 `input_tensor_list` | テンソルのリスト（タイルの数 = 9 個）。1つの形は `(1, 3, 640, 640)`、値は 0.0〜1.0、色は **R, G, B の順**、`device` 上にある |
+
+タイル1枚ごとの処理:
+
+1. 生画像からタイルの範囲を切り出す（numpy のスライスなのでコピーは作らない）
+2. `cv2.resize`（`INTER_LINEAR`）で 548×373 → 640×436 に変える
+3. 640×640 の灰色（値 114）の画像の中に貼り付ける（上下に 102 ピクセルずつの余白）
+4. BGR → RGB に並べ替える
+5. `(高さ, 幅, 色)` → `(色, 高さ, 幅)` に並べ替え、メモリ上で連続にする
+6. `torch` のテンソルにして **装置へ転送** する
+7. float16 / float32 に変換し、255 で割って 0.0〜1.0 にする
+8. 先頭にバッチの次元を足して `(1, 3, 640, 640)` にする
+
+- 計測時間には **CPU から GPU へのデータ転送** も含まれます。
+- 型の変換と正規化は転送後に行うので、GPU を使う場合は GPU 上で計算されます。
+
+#### ステップ4a `step4a_image_inference(detection_model, input_tensor_list)`
+
+ニューラルネットワークの順伝播だけを行います。NMS は行いません。
+
+| | 内容 |
+|---|---|
+| 入力 `detection_model` | `main()` で準備したネットワーク本体 |
+| 入力 `input_tensor_list` | ステップ3のテンソルのリスト |
+| 出力 `raw_prediction_list` | タイルごとの生の予測のリスト（9 個）。YOLOv8 では1つの形が `(1, 4 + クラス数, 8400)`。このプロジェクトは「apple」1クラスなので `(1, 5, 8400)` |
+
+- 8400 は 640×640 入力のときの候補の数（80×80 + 40×40 + 20×20）です。
+  各候補は `[中心x, 中心y, 幅, 高さ, apple の自信度]`（640×640 の画像上の座標）を持ちます。
+- `torch.no_grad()` の中で、**バッチサイズ 1 のまま 9 回** 順伝播します。
+- モデルの出力が組（タプル）の場合は、先頭の要素を検出結果として使います。
+
+#### ステップ4b `step4b_postprocess_nms(raw_prediction_list, tile_list, model_input_size, confidence_threshold, iou_threshold, merge_iou_threshold)`
+
+重なった検出枠をまとめ、枠の座標を生画像の座標に戻します。
+
+| | 内容 |
+|---|---|
+| 入力 `raw_prediction_list` | ステップ4aの生の予測のリスト |
+| 入力 `tile_list` | タイル位置のリスト（座標を生画像に戻すのに使う） |
+| 入力 `model_input_size` | モデル入力の一辺（レターボックスの計算をやり直すのに使う） |
+| 入力 `confidence_threshold` | `--conf`（既定 0.25）。これより自信度の低い候補を捨てる |
+| 入力 `iou_threshold` | `--iou`（既定 0.45）。タイル内の NMS のしきい値 |
+| 入力 `merge_iou_threshold` | `--merge-iou`（既定 0.5）。タイルをまたいだ統合のしきい値 |
+| 出力 `detection_boxes` | 検出枠。numpy 配列、形 `(M, 4)`、`[x1, y1, x2, y2]`（**生画像 1920×1080 のピクセル座標**）。M は検出数 |
+| 出力 `detection_scores` | 各枠の自信度。numpy 配列、形 `(M,)` |
+
+2段階で処理します。
+
+1. **タイルごとの NMS** … ultralytics の `non_max_suppression()` で自信度の低い候補を捨て、
+   重なった枠を1つにまとめます（結果は `[x1, y1, x2, y2, 自信度, クラス番号]`）。
+   そのあと、余白を引く → 縮小率で割る → タイルの左上の位置を足す、の順で
+   生画像の座標に戻します。
+2. **タイルをまたいだ統合** … 全タイルの枠をつなげ、`torchvision.ops.nms()` で
+   タイルの重なり部分で二重に検出された枠をまとめます。
+
+- どのタイルでも何も検出されなかったときは、形 `(0, 4)` と `(0,)` の空の配列を返します。
+- 計測時間には **GPU から CPU への結果の転送**（`.cpu().numpy()`）も含まれます。
+- クラス番号は1クラスなので捨てています。
+
+#### ステップ5 `step5_spatial_localization(depth_image_meters, detection_boxes, localization_settings)`
+
+検出枠と深度画像から、りんご1個ずつの3次元座標を求めます。
+
+| | 内容 |
+|---|---|
+| 入力 `depth_image_meters` | ステップ2の深度画像 `(1080, 1920)` |
+| 入力 `detection_boxes` | ステップ4bの検出枠 `(M, 4)` |
+| 入力 `localization_settings` | `build_localization_settings()` が作った辞書 |
+| 出力 `apple_position_list` | りんご1個につき1つの辞書のリスト（長さ M）。キーは下の表のとおり |
+
+中身は `localization_3d.estimate_apple_positions_3d()` で、枠ごとに次の計算をします。
+
+1. 枠の中央 `box_shrink_ratio`（既定 0.5 = 縦横それぞれ中央 50%）の範囲を深度画像から切り出す
+2. 深度が 0 より大きいピクセルだけを集め、`minimum_valid_pixels`（既定 10）個以上あれば
+   その**中央値**を深度とする（足りなければ深度 0 = 不明）
+3. 枠の中心 `(u, v)` と深度から、`X = (u−cx)·深度/fx`、`Y = (v−cy)·深度/fy`、`Z = 深度`
+   で3次元座標を求める（深度が不明なら NaN）
+
+出力の辞書のキー:
+
+| キー | 内容 |
+|---|---|
+| `detection_index` | 何番目の検出枠か |
+| `box_x1`, `box_y1`, `box_x2`, `box_y2` | 検出枠（生画像のピクセル座標） |
+| `center_u`, `center_v` | 枠の中心のピクセル位置 |
+| `valid_depth_pixels` | 深度の計算に使えたピクセルの数 |
+| `median_depth_m` | 深度の中央値（メートル）。0 なら深度が取れなかった |
+| `position_x/y/z_optical_m` | カメラ光学座標系の3次元座標（x=右, y=下, z=前） |
+| `position_x/y/z_sensor_m` | センサ座標系の3次元座標（X=右, Y=前, Z=上） |
+
+### 7-4. 1枚分の計測 `measure_one_image(...)`
+
+ステップ1〜5を順番に呼び、それぞれの前後で時間を測ります。
+
+| | 内容 |
+|---|---|
+| 入力 | カラー画像と点群のパス、`alignment_transform`、`localization_settings`、`tile_list`、モデル、`model_input_size`、`device`、`use_half_precision`、3つのしきい値 |
+| 出力 `measurement_result` | 計測結果の辞書（下の表） |
+| 出力 `apple_position_list` | ステップ5の出力そのもの |
+
+| キー | 内容 |
+|---|---|
+| `step1_acquisition_ms` 〜 `step5_localization_ms` | 各ステップの時間（ミリ秒）。4a と 4b は別々 |
+| `total_ms` | 上の6つの合計（ステップの間の、計測に含まれないわずかな時間は入らない） |
+| `num_tiles` | タイルの数 |
+| `num_points` | 点群の点の数 N |
+| `num_detections` | 検出数 M |
+| `num_detections_with_depth` | そのうち `median_depth_m > 0` の数 |
+
+`start_timer()` / `stop_timer()` は時刻を取る前に `torch.cuda.synchronize()`
+（MPS では `torch.mps.synchronize()`）を呼ぶので、GPU で非同期に動く計算も
+そのステップの時間に正しく含まれます。
+
+### 7-5. `main()` の入力と出力
+
+**入力（コマンドライン引数）**
+
+| 引数 | 既定値 | 内容 |
+|---|---|---|
+| `--weights` | （必須） | 学習済みの重みファイル(.pt) |
+| `--machine-name` | ホスト名 | 結果ファイルの名前と CSV の列に使うマシン名 |
+| `--repeats` | 10 | 1枚あたりの計測回数 |
+| `--warmup` | 5 | 最初に行う準備運転の回数（計測から除外） |
+| `--warmup-per-image` | 1 | 画像を切り替えるたびの準備運転の回数（計測から除外） |
+| `--limit-images` | 0 | 計測する画像の枚数の上限（0 なら全部） |
+| `--device` | `auto` | 計算装置 |
+| `--half` | なし | 指定すると float16 で推論（CUDA 以外では警告を出して無効） |
+| `--imgsz` | 640 | モデル入力の一辺 |
+| `--conf` / `--iou` / `--merge-iou` | 0.25 / 0.45 / 0.5 | ステップ4bのしきい値 |
+| `--camera-params` | `camera_params.yaml` | カメラパラメータのファイル |
+| `--scene-list` | `outputs/splits/scenes_test.txt` | 計測するシーンの一覧 |
+| `--dataset-root` | 既定の場所 | データセットの場所 |
+
+**入力（ファイル）**
+
+- シーン一覧（無ければ `prepare_dataset.py` を先に実行するよう促して止まる）
+- シーンごとのカラー画像 `<シーン名>_RGB.jpg` と点群 `outputs/point_cloud_npy/<シーン名>_pc.npy`
+  （`.npy` が無いシーンは警告を出して飛ばす。1つも無ければ止まる）
+- `camera_params.yaml`、重みファイル
+
+**出力（`outputs/measurements/` に保存。列の意味は [3. 出力ファイルの見方](#3-出力ファイルの見方)）**
+
+| ファイル | 内容 |
+|---|---|
+| `timings_raw_<マシン名>.csv` | `measure_one_image()` の結果1回分が1行（画像の枚数 × `--repeats` 行）。ウォームアップの分は入らない |
+| `timings_summary_<マシン名>.csv` | ステップごとに1行。`timing_utils.summarize_measurements()` で求めた平均・中央値・標準偏差・最小・最大・95パーセンタイルと、平均で見た全体に占める割合。マシン情報も各行に入る |
+| `machine_info_<マシン名>.json` | マシン情報と計測の設定（重みファイル、回数、画像の枚数、タイルの数、入力サイズ、バッチサイズ 1、半精度の有無） |
+| `detections_<マシン名>.csv` | 各画像の**最後の繰り返し**で得た、りんご1個ごとの3次元座標（ステップ5の出力の辞書 + マシン名 + シーン名）。検出が1つも無ければ作られない |
+
+画面には、画像ごとの平均合計時間と検出数、最後にステップごとの平均・中央値・標準偏差・割合と
+1秒あたりの処理枚数 (FPS) を表示します。
+
+---
+
+## 8. 設定ファイル `camera_params.yaml`
 
 カメラのパラメータと、ステップ2・ステップ5・タイル分割の動作を変更できます。
 すべての項目に日本語の説明を書いてあります。主な項目は次のとおりです。
@@ -466,7 +756,7 @@ Kinect v2 は深度センサとカラーカメラが物理的に離れた位置�
 
 ---
 
-## 8. 困ったときは
+## 9. 困ったときは
 
 **`ModuleNotFoundError: No module named 'torch'` と出る**
 → 仮想環境が有効になっていません。`source .venv/bin/activate` を実行してください。
@@ -503,7 +793,7 @@ Kinect v2 は深度センサとカラーカメラが物理的に離れた位置�
 
 ---
 
-## 9. データセットの利用について
+## 10. データセットの利用について
 
 KFuji RGB-DS database は **CC-BY-NC-SA 4.0**（研究・教育目的のみ、商用利用不可）です。
 配布元は Zenodo の <https://zenodo.org/records/3715991> です
