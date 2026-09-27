@@ -9,28 +9,29 @@ Mermaid 記法でまとめたものです。各処理の入力と出力の詳し
 
 1枚の画像を処理するとき（`measure_one_image()` の中）の、データの受け渡しです。
 四角は処理、角の丸い四角はデータ、灰色は計測の外で1回だけ準備するものです。
+準備の部分は、ステップに直接渡るデータだけを載せています
+（`camera_params.yaml` や重みファイルからそれらを作る過程は省略）。
+
+各データの下の段は、中身の実質的な大きさ（要素数 × 1要素のバイト数）です。
+Python のオブジェクトやテンソルの管理情報の分は含みません。
+1 MB = 10⁶ B、1 KB = 10³ B です。N は点群の点の数、M は検出したりんごの数で、
+手元のデータでは N = 119,316〜176,354（中央値 166,262）、
+M = 70〜172（中央値 128）でした。
 
 ```mermaid
 flowchart TD
-    %% ---- 計測の外で1回だけ準備するもの ----
+    %% ---- 計測の外で1回だけ準備するもの（ステップに直接渡るものだけ） ----
     subgraph PREP["準備（計測の外・1回だけ）"]
-        YAML[/"camera_params.yaml"/]
-        WEIGHTS[/"重みファイル .pt"/]
-        ARGS[/"コマンドライン引数<br/>--imgsz --conf --iou --merge-iou<br/>--device --half"/]
-        AT(["alignment_transform"])
-        LS(["localization_settings"])
-        TL(["tile_list<br/>9個の (x, y, 幅, 高さ)"])
-        MODEL(["detection_model<br/>eval + fuse + 装置へ転送"])
-        YAML -->|build_alignment_transform| AT
-        YAML -->|build_localization_settings| LS
-        YAML -->|"build_tile_list（tiling）"| TL
-        WEIGHTS -->|"YOLO(...).model"| MODEL
-        ARGS -.-> MODEL
+        ARGS[/"コマンドライン引数<br/>imgsz, conf, iou, merge-iou, device, half<br/>数値6個で約 50 B"/]
+        AT(["alignment_transform<br/>3×3 回転行列 + 並進 + 内部パラメータ など<br/>約 170 B"])
+        LS(["localization_settings<br/>数値6個 × 8 B = 48 B"])
+        TL(["tile_list<br/>9個の (x, y, 幅, 高さ)<br/>9 × 4 × 8 B = 288 B"])
+        MODEL(["detection_model（YOLOv8n, fuse 済み）<br/>3,005,843 パラメータ × 4 B（約 12.0 MB）<br/>（--half のとき約 6.0 MB）"])
     end
 
     %% ---- 入力ファイル ----
-    JPG[/"シーン名_RGB.jpg"/]
-    NPY[/"シーン名_pc.npy"/]
+    JPG[/"シーン名_RGB.jpg<br/>JPEG 圧縮で約 0.38〜0.50 MB"/]
+    NPY[/"シーン名_pc.npy<br/>32N B（約 3.8〜5.6 MB）"/]
 
     %% ---- ステップ1〜5 ----
     S1["ステップ1 画像取得<br/>step1_image_acquisition"]
@@ -41,13 +42,13 @@ flowchart TD
     S5["ステップ5 3D空間位置推定<br/>step5_spatial_localization"]
 
     %% ---- 中間データ ----
-    COLOR(["color_image_bgr<br/>(1080, 1920, 3) uint8 BGR"])
-    PC(["point_cloud_array<br/>(N, 8) float32"])
-    DEPTH(["depth_image_meters<br/>(1080, 1920) float32"])
-    TENSORS(["input_tensor_list<br/>9 × (1, 3, 640, 640)"])
-    RAW(["raw_prediction_list<br/>9 × (1, 5, 8400)"])
-    BOXES(["detection_boxes (M, 4)<br/>detection_scores (M,)"])
-    APPLES(["apple_position_list<br/>M 個の辞書"])
+    COLOR(["color_image_bgr<br/>(1080, 1920, 3) uint8 BGR<br/>6,220,800 B（約 6.2 MB）"])
+    PC(["point_cloud_array<br/>(N, 8) float32<br/>32N B（約 3.8〜5.6 MB）"])
+    DEPTH(["depth_image_meters<br/>(1080, 1920) float32<br/>8,294,400 B（約 8.3 MB）"])
+    TENSORS(["input_tensor_list<br/>9 × (1, 3, 640, 640) float32<br/>44,236,800 B（約 44.2 MB）<br/>（--half のとき約 22.1 MB）"])
+    RAW(["raw_prediction_list<br/>9 × (1, 5, 8400) float32<br/>1,512,000 B（約 1.5 MB）<br/>（--half のとき約 0.76 MB）"])
+    BOXES(["detection_boxes (M, 4) float32<br/>detection_scores (M,) float32<br/>20M B（約 1.4〜3.4 KB）"])
+    APPLES(["apple_position_list<br/>M 個の辞書（数値13個ずつ）<br/>104M B（約 7〜18 KB）"])
 
     JPG --> S1
     NPY --> S1
@@ -78,7 +79,7 @@ flowchart TD
     S5 --> APPLES
 
     classDef prep fill:#eeeeee,stroke:#888888,color:#333333
-    class YAML,WEIGHTS,ARGS,AT,LS,TL,MODEL prep
+    class ARGS,AT,LS,TL,MODEL prep
 ```
 
 **読み取れること**
