@@ -43,7 +43,21 @@ def get_project_root():
 
 
 def get_default_dataset_root():
-    """データセットの置き場所（KFuji_RGB-DS_dataset フォルダ）の既定のパスを返す。"""
+    """
+    データセットの置き場所（KFuji_RGB-DS_dataset フォルダ）の既定のパスを返す。
+
+    環境変数 KFUJI_DATASET_ROOT が設定されていれば、その場所を使います。
+    外付けSSDなど、プロジェクトの外にデータセットを置きたいときに便利です。
+        例: export KFUJI_DATASET_ROOT=/mnt/ssd/KFuji_RGB-DS_dataset
+    設定されていなければ、従来どおり harvest_nn/KFuji_RGB-DS_dataset を使います。
+    （各スクリプトの --dataset-root を指定した場合は、そちらが優先されます）
+    """
+    # 環境変数が設定されているかを調べる（設定が無ければ None が返る）
+    dataset_root_from_environment = os.environ.get("KFUJI_DATASET_ROOT")
+    # 設定されていて、空文字でもなければ、その場所を使う
+    if dataset_root_from_environment:
+        # 相対パスで書かれていても困らないよう、絶対パスに直して返す
+        return os.path.abspath(os.path.expanduser(dataset_root_from_environment))
     # プロジェクトの一番上のフォルダを取得する
     project_root = get_project_root()
     # その下にある KFuji_RGB-DS_dataset をつなげてパスを作る
@@ -170,6 +184,14 @@ def list_all_crop_names(dataset_root):
     preprocessed_directory = get_preprocessed_data_directory(dataset_root)
     # その下の annotations フォルダのパスを作る
     annotations_directory = os.path.join(preprocessed_directory, "annotations")
+    # フォルダが無ければ、データセットがまだ用意できていないので分かりやすく知らせる
+    if not os.path.isdir(annotations_directory):
+        raise FileNotFoundError(
+            "データセットのアノテーションフォルダが見つかりません: " + annotations_directory + "\n"
+            + "先に python src/fetch_dataset.py を実行してデータセットを取得してください。\n"
+            + "（すでに手元にある場合は --dataset-root か環境変数 KFUJI_DATASET_ROOT で"
+            + "置き場所を指定してください）"
+        )
     # 結果を入れるための空のリストを用意する
     crop_name_list = []
     # annotations フォルダの中のファイル名を名前順に1つずつ見ていく
