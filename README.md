@@ -84,7 +84,7 @@ python src/prepare_dataset.py --dataset-root /mnt/ssd/KFuji_RGB-DS_dataset
 
 ### 1-2. ライブラリをインストールする
 
-**Python 3.11 または 3.12 が必要です。**
+**Python 3.11 または 3.12 が必要です**（Jetson だけは OS 標準の 3.10 で動きます。1-3 を参照）。
 （PyTorch と Ultralytics は、まだ Python 3.13 / 3.14 に対応していません）
 
 #### Mac / Linux ワークステーションの場合
@@ -103,31 +103,222 @@ pip install -r requirements.txt
 
 一度ターミナルを閉じたあと、また作業するときは `source .venv/bin/activate` だけを実行します。
 
-#### NVIDIA Jetson の場合
+Jetson と Raspberry Pi の場合は、次の 1-3 の手順で進めてください。
+
+### 1-3. Jetson / Raspberry Pi で計測する
+
+**コードの変更は要りません。** 計算装置は自動で選ばれます（Jetson は `cuda`、Raspberry Pi は `cpu`）。
+Jetson / Raspberry Pi では**学習はせず、Mac で学習した重みを使って計測だけ**を行います。
+
+全体の流れ:
+
+```
+Ⓐ 本体の初期設定 → Ⓑ コードを取得 → Ⓒ ライブラリを入れる（機種ごとに違う）
+→ Ⓓ データを取得 → Ⓔ Mac から重みをコピー → Ⓕ データ準備 → Ⓖ 計測 → Ⓗ 結果を Mac に戻して比較
+```
+
+違うのは Ⓐ と Ⓒ だけで、残りは両方とも同じです。
+
+#### Ⓐ 本体の初期設定
+
+**Jetson（Orin Nano / Orin NX / AGX Orin を想定）**
+
+1. NVIDIA の Jetson の「Getting Started」ページの手順どおりに、JetPack（Jetson 用の OS 一式）を
+   microSD カードまたは NVMe SSD に書き込みます（Orin Nano 開発者キットは SD カード用のイメージがあります）。
+2. モニター・キーボード・マウス・LAN をつないで電源を入れ、画面の案内に従ってユーザー名などを設定します。
+3. ターミナルを開いて、JetPack のバージョンを確認します（Ⓒ で使います）。
+
+   ```bash
+   cat /etc/nv_tegra_release   # "R36 ..." なら JetPack 6 系
+   ```
+
+**Raspberry Pi（Pi 5 または Pi 4、メモリ 4GB 以上を推奨）**
+
+1. パソコンに [Raspberry Pi Imager](https://www.raspberrypi.com/software/) を入れ、
+   **「Raspberry Pi OS (64-bit)」** を microSD カードに書き込みます。
+   **必ず 64-bit 版を選んでください**（32-bit 版では PyTorch が入りません）。
+2. 書き込む前の「設定を編集する」画面で、ユーザー名・パスワード・Wi-Fi を設定し、
+   **「SSH を有効にする」にチェック**を入れます。こうすると、モニターをつながなくても Mac から操作できます。
+3. 熱で遅くなると計測結果がぶれるので、ヒートシンクかファン（Pi 5 なら純正の Active Cooler）を付けます。
+4. 電源を入れて1〜2分待ち、Mac のターミナルから接続します。
+
+   ```bash
+   ssh <ユーザー名>@<ホスト名>.local    # 例: ssh pi@raspberrypi.local
+   uname -m                             # aarch64 と表示されれば 64-bit 版で OK
+   ```
+
+> **Mac から操作すると楽です。** Jetson も同じ LAN につながっていれば、
+> Jetson 上で `hostname -I` を実行して IP アドレスを調べ、Mac から `ssh <ユーザー名>@<IPアドレス>` で入れます。
+> 以降のコマンドは、特に書いていない限り **Jetson / Raspberry Pi 上で**実行します。
+
+#### Ⓑ コードを取得する
+
+```bash
+cd ~
+git clone https://github.com/Hanibuchi/harvest_nn.git
+cd harvest_nn
+```
+
+#### Ⓒ ライブラリを入れる
+
+**Jetson の場合**
 
 **Jetson では torch / torchvision を通常の pip で入れてはいけません。**
-pip で配布されている標準版は x86 パソコン用のため、Jetson では動きません。
-NVIDIA が配布している Jetson 専用の wheel を先に入れてください。
+PyPI の標準版は GPU（CUDA）を使えないため、NVIDIA が用意している Jetson 専用版を入れます。
 
 ```bash
 # 1. 仮想環境を作る（--system-site-packages を付けるのが重要。
 #    Jetson にあらかじめ入っている OpenCV などを使えるようにするため）
+sudo apt update
+sudo apt install -y python3-venv python3-pip
 python3 -m venv --system-site-packages .venv
 source .venv/bin/activate
+pip install --upgrade pip
 
-# 2. NVIDIA 提供の torch / torchvision を入れる
-#    お使いの JetPack のバージョンに合う wheel を
-#    https://developer.nvidia.com/embedded/downloads から入手してください
-pip install torch-*.whl torchvision-*.whl
+# 2. Jetson 専用の torch / torchvision を入れる
+#    下の URL は JetPack 6 系（CUDA 12.6）用です。JetPack のバージョンが違う場合は
+#    https://pypi.jetson-ai-lab.io/ で合うものを探して、URL の末尾を置き換えてください
+pip install torch torchvision --index-url https://pypi.jetson-ai-lab.io/jp6/cu126
 
-# 3. torch と torchvision の行を除いた残りを入れる
+# 3. 残りのライブラリを入れる（torch / torchvision / opencv-python は入れない）
 pip install numpy scipy ultralytics pandas matplotlib PyYAML psutil
 
 # 4. 正しく入ったか確認する（True と表示されれば GPU が使えます）
-python -c "import torch; print(torch.cuda.is_available())"
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
 
-Jetson では `--workers 2` を付けて学習すると、メモリ不足になりにくいです。
+4 で `False` と出た場合は、3 の途中で ultralytics が GPU 非対応版の torch に入れ替えてしまっています。
+`pip uninstall -y torch torchvision` をしてから 2 をやり直してください。
+
+計測の前に、Jetson を**最大性能・クロック固定**にしておきます（毎回の再起動後に必要です）。
+どのモードで測ったかで結果が大きく変わるので、使ったモードをメモしておいてください。
+
+```bash
+sudo nvpmodel -m 0     # 最大性能の電力モードにする（sudo nvpmodel -q で現在のモードを確認）
+sudo jetson_clocks     # CPU / GPU のクロックを最大に固定する
+```
+
+**Raspberry Pi の場合**
+
+Raspberry Pi 用（ARM 64-bit）の PyTorch は通常の pip で入るので、Mac と同じ手順です。
+
+```bash
+python3 --version      # 3.11 や 3.12 ならそのまま進める
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+
+# 確認（エラーが出なければ OK。Raspberry Pi に GPU は無いので False で正常です）
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+```
+
+`python3 --version` が 3.13 以上で torch が入らない場合は、[uv](https://docs.astral.sh/uv/) で 3.12 を用意します。
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source ~/.bashrc                         # uv コマンドを使えるようにする
+uv venv --python 3.12 .venv
+source .venv/bin/activate
+uv pip install -r requirements.txt
+```
+
+#### Ⓓ データを取得する
+
+計測に必要な分だけ（約500MB）を取得します。
+
+```bash
+python src/fetch_dataset.py --parts raw,annotations
+```
+
+#### Ⓔ Mac から学習済みの重みをコピーする
+
+`outputs/` は git で管理していないので、`git clone` では重みが届きません。
+**Mac のターミナルで**、`harvest_nn` フォルダに移動してから実行します。
+
+```bash
+# <ユーザー名>@<IPアドレス> は Jetson / Raspberry Pi のものに置き換える
+ssh <ユーザー名>@<IPアドレス> "mkdir -p ~/harvest_nn/outputs/weights"
+scp outputs/weights/yolov8n_apple_best.pt <ユーザー名>@<IPアドレス>:~/harvest_nn/outputs/weights/
+```
+
+#### Ⓕ データを準備する
+
+```bash
+python src/prepare_dataset.py
+```
+
+分割は乱数シードが同じなら毎回同じになるので、**Mac と同じ test セット**ができます
+（Mac で既定値以外の引数を使った場合は、同じ引数を付けてください）。
+念のため、両方で次のコマンドの結果が一致することを確認してください。
+
+```bash
+cat outputs/splits/scenes_test.txt
+```
+
+切り出し画像（`images`）を取得していなくても、計測に必要な準備は問題なく終わります。
+最後に「次は学習を実行してください」と表示されますが、Jetson / Raspberry Pi では学習は不要なので無視して Ⓖ に進みます。
+
+#### Ⓖ 計測する
+
+まず、画像3枚・繰り返し2回で動作を確かめ、1枚あたりにかかる時間を見ておきます。
+
+```bash
+python src/measure_centralized.py \
+    --weights outputs/weights/yolov8n_apple_best.pt \
+    --machine-name test --limit-images 3 --repeats 2
+```
+
+問題なければ本計測をします。`--machine-name` はマシンが分かる名前にします。
+
+```bash
+# Jetson
+python src/measure_centralized.py \
+    --weights outputs/weights/yolov8n_apple_best.pt \
+    --machine-name jetson_orin_nano
+
+# Jetson で半精度(float16)も試す場合（Jetson の GPU では速くなることが多い）
+python src/measure_centralized.py \
+    --weights outputs/weights/yolov8n_apple_best.pt \
+    --machine-name jetson_orin_nano_fp16 --half
+
+# Raspberry Pi
+python src/measure_centralized.py \
+    --weights outputs/weights/yolov8n_apple_best.pt \
+    --machine-name raspi5
+```
+
+- Raspberry Pi は GPU を使わないので、Mac や Jetson よりかなり時間がかかります。
+  動作確認で時間がかかりすぎる場合は `--repeats 5` などで回数を減らしてください。
+- SSH が切れると計測も止まります。長く走らせるときは `nohup python src/measure_centralized.py ... > measure.log 2>&1 &`
+  のように実行すると、接続が切れても続きます（進み具合は `tail -f measure.log` で見られます）。
+- Raspberry Pi では計測のあとに `vcgencmd get_throttled` を実行し、`throttled=0x0` なら
+  熱や電源不足による速度低下は起きていません。それ以外の値なら冷却や電源を見直して測り直してください。
+
+#### Ⓗ 結果を Mac に戻して比較する
+
+**Mac のターミナルで**実行します。
+
+```bash
+scp "<ユーザー名>@<IPアドレス>:~/harvest_nn/outputs/measurements/timings_summary_*.csv" outputs/measurements/
+
+python src/compare_machines.py \
+    --summary-csv outputs/measurements/timings_summary_macbook_m1.csv \
+                  outputs/measurements/timings_summary_jetson_orin_nano.csv \
+                  outputs/measurements/timings_summary_raspi5.csv
+```
+
+#### 困ったとき
+
+| 症状 | 原因と対処 |
+|---|---|
+| Jetson で `torch.cuda.is_available()` が `False` | GPU 非対応の torch が入っている。`pip uninstall -y torch torchvision` → Ⓒ の 2 をやり直す |
+| Raspberry Pi で torch が入らない / `Illegal instruction` | 32-bit 版の OS。`uname -m` が `aarch64` でなければ 64-bit 版を入れ直す |
+| 途中で `Killed` と出て止まる | メモリ不足。他のアプリを閉じる、`--limit-images` を小さくする |
+| 「計測対象のシーン一覧が見つかりません」 | Ⓕ の `prepare_dataset.py` を実行していない |
+| 「点群の .npy が見つかりません」 | Ⓓ で `raw` を取得していない、または Ⓕ を実行していない |
+| `No such file` で重みが見つからない | Ⓔ のコピー先を確認する（`ls outputs/weights`） |
+| `ssh: Could not resolve hostname` | `<ホスト名>.local` の代わりに IP アドレスで接続する |
 
 ---
 
